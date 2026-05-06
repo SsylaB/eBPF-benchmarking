@@ -21,19 +21,13 @@ VMLINUX := $(abspath ./vmlinux.h)
 # -I../../libbpf/include/uapi  → libbpf's own UAPI headers
 # -I$(dir $(VMLINUX))          → finds vmlinux.h (current directory)
 INCLUDES := -I$(OUTPUT) -I../../libbpf/include/uapi -I../../libbpf/include -I$(dir $(VMLINUX))
-CFLAGS := -g -Wall
-ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
+CFLAGS := -g -Wall -O2
+
+# -lm is required for math.h (used by analyze percentile code in csw.c)
+ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS) -lm
 
 APPS = csw
 
-# Get Clang's default includes on this system. We'll explicitly add these dirs
-# to the includes list when compiling with `-target bpf` because otherwise some
-# architecture-specific dirs will be "missing" on some architectures/distros -
-# headers such as asm/types.h, asm/byteorder.h, asm/socket.h, asm/sockios.h,
-# sys/cdefs.h etc. might be missing.
-#
-# Use '-idirafter': Don't interfere with include mechanics except where the
-# build would have failed anyways.
 CLANG_BPF_SYS_INCLUDES ?= $(shell $(CLANG) -v -E - </dev/null 2>&1 \
 	| sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
 
@@ -102,7 +96,6 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
 	$(Q)$(BPFTOOL) gen skeleton $< > $@
 
 # Build user-space code
-# This line makes csw.o depend on csw.skel.h before compiling csw.c
 $(patsubst %,$(OUTPUT)/%.o,$(APPS)): %.o: %.skel.h
 
 $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
@@ -114,8 +107,16 @@ $(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
 
-# delete failed targets
-.DELETE_ON_ERROR:
+# Install Python deps for analysis
+.PHONY: deps
+deps:
+	pip install numpy pandas matplotlib
 
-# keep intermediate (.skel.h, .bpf.o, etc) targets
+# Run a quick single-PID trace test (set PID= on the command line)
+.PHONY: test
+test:
+	@[[ -n "$(PID)" ]] || (echo "Usage: make test PID=<pid>"; exit 1)
+	sudo ./csw -p $(PID) -d 10
+
+.DELETE_ON_ERROR:
 .SECONDARY:

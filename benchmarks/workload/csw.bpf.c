@@ -6,97 +6,113 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} target_pid SEC(".maps");
 
-/*
- * Store the timestamp of when a task was last switched OUT.
- * key   = pid/tid (u32)
- * value = ktime_get_ns() at switch-out (u64)
- */
+struct task_state {
+    u64 switch_out_ts;
+    u64 switch_in_ts;
+    u32 last_cpu;
+    u32 initialized;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 16384);
+    __uint(max_entries, 1024);
     __type(key, u32);
-    __type(value, u64);
-} start SEC(".maps");
+    __type(value, struct task_state);
+} task_states SEC(".maps");
 
+#define EVT_OFFCPU   0
+#define EVT_ONCPU    1
+#define EVT_MIGRATE  2
 
-/*
- * Event sent to userspace via ring buffer.
- * Represents one completed off-CPU interval for a task.
- */
 struct event {
-    u32 pid;            /* PID of the task that just woke up   */
-    u64 latency_ns;     /* time spent off-CPU, in nanoseconds   */
-    char comm[TASK_COMM_LEN]; /* comm of the waking task        */
+    u64  timestamp_ns;
+    u32  pid;
+    u32  cpu;
+    u8   type;
+    u8   pad[3];
+    u64  duration_ns;
+    u32  prev_cpu;
+    char comm[TASK_COMM_LEN];
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 1 << 20);
 } events SEC(".maps");
 
+static __always_inline int emit_event(u32 pid, u32 cpu, u8 type,
+                                      u64 duration_ns, u32 prev_cpu, u64 ts)
+{
+    struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return -1;
+    e->timestamp_ns = ts;
+    e->pid          = pid;
+    e->cpu          = cpu;
+    e->type         = type;
+    e->duration_ns  = duration_ns;
+    e->prev_cpu     = prev_cpu;
+    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
 
-/*
- * sched_switch tracepoint handler.
- *
- * Fired on every context switch:
- *   prev = task being switched OUT  (going to sleep / preempted)
- *   next = task being switched IN   (waking up / resuming)
- *
- * We record when prev goes off-CPU, and compute how long next
- * was off-CPU when it comes back on.
- */
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 {
-    u32 prev_pid = ctx->prev_pid;
-    u32 next_pid = ctx->next_pid;
-    u64 ts = bpf_ktime_get_ns();
-
-    struct event *e;
-    u64 *tsp;
-
-    /*
-     * CASE 1: task switching OUT → record its departure timestamp.
-     * Skip PID 0 (idle task): it has no meaningful off-CPU latency.
-     */
-    if (prev_pid != 0) {
-        bpf_map_update_elem(&start, &prev_pid, &ts, BPF_ANY);
-    }
-
-    /*
-     * CASE 2: task switching IN → compute how long it was off-CPU.
-     * Skip PID 0 (idle task): waking idle is not a real context switch
-     * of interest and would produce misleading latency values.
-     */
-    if (next_pid == 0)
+    u32 key = 0;
+    u32 *tpid = bpf_map_lookup_elem(&target_pid, &key);
+    if (!tpid || *tpid == 0)
         return 0;
 
-    tsp = bpf_map_lookup_elem(&start, &next_pid);
-    if (!tsp)
-        return 0;   /* first time we see this PID, no baseline yet */
+    u32 filter   = *tpid;
+    u32 prev_pid = ctx->prev_pid;
+    u32 next_pid = ctx->next_pid;
+    u64 ts       = bpf_ktime_get_ns();
+    u32 cpu      = bpf_get_smp_processor_id();
 
-    u64 delta = ts - *tsp;
+    // DEBUG: Print every time the filter PID is involved in a switch
+    if (prev_pid == filter || next_pid == filter) {
+        bpf_printk("CSW: Match PID %d | prev=%d next=%d cpu=%d", filter, prev_pid, next_pid, cpu);
+    }
 
-    /* Clean up the map entry — we've consumed this timestamp */
-    bpf_map_delete_elem(&start, &next_pid);
+    if (prev_pid == filter) {
+        struct task_state *st = bpf_map_lookup_elem(&task_states, &prev_pid);
+        if (!st) {
+            struct task_state new_st = { .switch_out_ts = ts, .last_cpu = cpu, .initialized = 1 };
+            bpf_map_update_elem(&task_states, &prev_pid, &new_st, BPF_ANY);
+        } else {
+            if (st->switch_in_ts != 0) {
+                emit_event(prev_pid, cpu, EVT_ONCPU, ts - st->switch_in_ts, st->last_cpu, ts);
+            }
+            st->switch_out_ts = ts;
+            st->switch_in_ts  = 0;
+            st->last_cpu      = cpu;
+        }
+    }
 
-    /* Reserve space in the ring buffer and fill the event */
-    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
-        return 0;   /* ring buffer full — drop this sample */
-
-    e->pid        = next_pid;
-    e->latency_ns = delta;
-
-    /*
-     * bpf_get_current_comm() returns the comm of the task currently
-     * executing on this CPU.  At this point in sched_switch the kernel
-     * has already context-switched, so "current" is next — correct.
-     */
-    bpf_get_current_comm(e->comm, sizeof(e->comm));
-
-    bpf_ringbuf_submit(e, 0);
+    if (next_pid == filter) {
+        struct task_state *st = bpf_map_lookup_elem(&task_states, &next_pid);
+        if (!st) {
+            struct task_state new_st = { .switch_in_ts = ts, .last_cpu = cpu, .initialized = 1 };
+            bpf_map_update_elem(&task_states, &next_pid, &new_st, BPF_ANY);
+        } else {
+            if (st->initialized && st->last_cpu != cpu)
+                emit_event(next_pid, cpu, EVT_MIGRATE, 0, st->last_cpu, ts);
+            if (st->switch_out_ts != 0) {
+                emit_event(next_pid, cpu, EVT_OFFCPU, ts - st->switch_out_ts, st->last_cpu, ts);
+            }
+            st->switch_in_ts  = ts;
+            st->switch_out_ts = 0;
+            st->last_cpu      = cpu;
+        }
+    }
 
     return 0;
 }
