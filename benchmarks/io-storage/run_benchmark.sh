@@ -2,7 +2,7 @@
 # Usage: sudo ./run_benchmark.sh [output.csv]
 
 OUTPUT=${1:-"results/run_$(date +%Y%m%d_%H%M%S).csv"}
-FIO_FILE="/tmp/fio_test"          # doit correspondre à --filename dans fio
+FIO_FILE="/mnt/disk/fio_test"          # doit correspondre à --filename dans fio
 BASELINE_SECS=3                   # fenêtre baseline avant fio
 
 mkdir -p results
@@ -20,9 +20,9 @@ echo "==> write_lat lancé (PID=$WLAT_PID), collecte baseline..."
 sleep $BASELINE_SECS
 
 # 3. Lance fio
-fio --name=write_4k --rw=write --bs=4k --size=4G \
+fio --name=write_4k --rw=write --bs=4k --size=512M  \
     --filename=$FIO_FILE --direct=1 --runtime=30 --time_based \
-    --ioengine=sync \
+    --ioengine=sync --loops=999 \
     --output=results/fio_stats.json --output-format=json &
 
 
