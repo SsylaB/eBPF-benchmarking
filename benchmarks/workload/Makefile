@@ -115,8 +115,8 @@ deps:
 # Run a quick single-PID trace test (set PID= on the command line)
 .PHONY: test
 test:
-	@[[ -n "$(PID)" ]] || (echo "Usage: make test PID=<pid>"; exit 1)
-	sudo ./csw -p $(PID) -d 10
+	@[[ -n "$(PID)" ]] || (echo "Usage: make test PID=<pid> OFFSET=<hex>"; exit 1)
+	sudo ./csw $(PID) $(OFFSET)
 
 .DELETE_ON_ERROR:
 .SECONDARY:
